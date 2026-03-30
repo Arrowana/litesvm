@@ -4,12 +4,15 @@ use hashbrown::HashMap;
 use std::collections::HashMap;
 use {
     crate::error::{InvalidSysvarDataError, LiteSVMError},
+    agave_feature_set::{raise_cpi_nesting_limit_to_8, FeatureSet},
+    agave_syscalls::create_program_runtime_environment,
     log::error,
     serde::de::DeserializeOwned,
     solana_account::{state_traits::StateMut, AccountSharedData, ReadableAccount, WritableAccount},
     solana_address::Address,
     solana_address_lookup_table_interface::{error::AddressLookupError, state::AddressLookupTable},
     solana_clock::Clock,
+    solana_compute_budget::compute_budget::ComputeBudget,
     solana_instruction::error::InstructionError,
     solana_loader_v3_interface::state::UpgradeableLoaderState,
     solana_loader_v4_interface::state::LoaderV4State,
@@ -20,9 +23,10 @@ use {
     solana_nonce as nonce,
     solana_program_runtime::{
         loaded_programs::{
-            LoadProgramMetrics, ProgramCacheEntry, ProgramCacheEntryOwner, ProgramCacheEntryType,
+            ProgramCacheEntry, ProgramCacheEntryOwner, ProgramCacheEntryType,
             ProgramCacheForTxBatch, ProgramRuntimeEnvironments,
         },
+        program_metrics::LoadProgramMetrics,
         sysvar_cache::SysvarCache,
     },
     solana_sdk_ids::{
@@ -66,12 +70,59 @@ where
     Ok(())
 }
 
-#[derive(Clone, Default)]
 pub struct AccountsDb {
     pub inner: HashMap<Address, AccountSharedData>,
     pub programs_cache: ProgramCacheForTxBatch,
     pub sysvar_cache: SysvarCache,
     pub environments: ProgramRuntimeEnvironments,
+}
+
+fn default_program_runtime_environments() -> ProgramRuntimeEnvironments {
+    let feature_set = FeatureSet::default();
+    let runtime_features = feature_set.runtime_features();
+    let compute_budget =
+        ComputeBudget::new_with_defaults(feature_set.is_active(&raise_cpi_nesting_limit_to_8::ID));
+    let execution = create_program_runtime_environment(
+        &runtime_features,
+        &compute_budget.to_budget(),
+        false,
+        false,
+    )
+    .expect("default program runtime environment should be valid");
+    let deployment = create_program_runtime_environment(
+        &runtime_features,
+        &compute_budget.to_budget(),
+        false,
+        false,
+    )
+    .expect("default deployment runtime environment should be valid");
+
+    ProgramRuntimeEnvironments::new(execution, deployment)
+}
+
+impl Clone for AccountsDb {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            programs_cache: self.programs_cache.clone(),
+            sysvar_cache: self.sysvar_cache.clone(),
+            environments: ProgramRuntimeEnvironments::new(
+                self.environments.get_env_for_execution().clone(),
+                self.environments.get_env_for_deployment().clone(),
+            ),
+        }
+    }
+}
+
+impl Default for AccountsDb {
+    fn default() -> Self {
+        Self {
+            inner: HashMap::default(),
+            programs_cache: ProgramCacheForTxBatch::default(),
+            sysvar_cache: SysvarCache::default(),
+            environments: default_program_runtime_environments(),
+        }
+    }
 }
 
 impl AccountsDb {
@@ -235,13 +286,13 @@ impl AccountsDb {
         let metrics = &mut LoadProgramMetrics::default();
 
         let owner = program_account.owner();
-        let program_runtime_v1 = self.environments.program_runtime_v1.clone();
+        let program_runtime_environment = self.environments.get_env_for_execution().clone();
         let slot = self.sysvar_cache.get_clock().unwrap().slot;
 
         if bpf_loader::check_id(owner) || bpf_loader_deprecated::check_id(owner) {
             ProgramCacheEntry::new(
                 owner,
-                program_runtime_v1,
+                program_runtime_environment,
                 slot,
                 slot,
                 program_account.data(),
@@ -275,7 +326,7 @@ impl AccountsDb {
             {
                 ProgramCacheEntry::new(
                     owner,
-                    program_runtime_v1,
+                    program_runtime_environment,
                     slot,
                     slot,
                     programdata,
@@ -298,7 +349,7 @@ impl AccountsDb {
             {
                 ProgramCacheEntry::new(
                     &loader_v4::id(),
-                    program_runtime_v1,
+                    program_runtime_environment,
                     slot,
                     slot,
                     elf_bytes,

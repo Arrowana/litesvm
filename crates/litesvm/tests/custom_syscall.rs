@@ -7,7 +7,10 @@ use {
     solana_native_token::LAMPORTS_PER_SOL,
     solana_program_runtime::{
         invoke_context::InvokeContext,
-        solana_sbpf::{declare_builtin_function, memory_region::MemoryMapping},
+        solana_sbpf::{
+            declare_builtin_function, memory_region::MemoryMapping,
+            program::BuiltinFunctionDefinition,
+        },
     },
     solana_signer::Signer,
     solana_transaction::Transaction,
@@ -20,7 +23,7 @@ declare_builtin_function!(
     /// A custom syscall to burn CUs.
     SyscallBurnCus,
     fn rust(
-        invoke_context: &mut InvokeContext,
+        invoke_context: &mut InvokeContext<'_, '_>,
         to_burn: u64,
         _arg2: u64,
         _arg3: u64,

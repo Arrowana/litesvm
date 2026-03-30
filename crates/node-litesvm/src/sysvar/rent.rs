@@ -6,13 +6,27 @@ use {
         util::{bigint_to_u64, bigint_to_usize},
     },
     napi::bindgen_prelude::*,
-    solana_rent::{Rent as RentOriginal, RentDue},
+    solana_rent::{Rent as RentOriginal, ACCOUNT_STORAGE_OVERHEAD},
 };
 
+const DEFAULT_SLOTS_PER_EPOCH: u64 = 432_000;
+const DEFAULT_EXEMPTION_THRESHOLD: f64 = 2.0;
+
 /// Configuration of network rent.
-#[derive(Default, Debug)]
+#[derive(Debug)]
 #[napi]
 pub struct Rent(pub(crate) RentOriginal);
+
+impl Default for Rent {
+    fn default() -> Self {
+        let default_rent = RentOriginal::default();
+        Self(RentOriginal {
+            lamports_per_byte: default_rent.lamports_per_byte / DEFAULT_EXEMPTION_THRESHOLD as u64,
+            exemption_threshold: DEFAULT_EXEMPTION_THRESHOLD.to_le_bytes(),
+            burn_percent: default_rent.burn_percent,
+        })
+    }
+}
 
 #[napi]
 impl Rent {
@@ -26,8 +40,8 @@ impl Rent {
         burn_percent: u8,
     ) -> Result<Self> {
         Ok(Self(RentOriginal {
-            lamports_per_byte_year: bigint_to_u64(&lamports_per_byte_year)?,
-            exemption_threshold,
+            lamports_per_byte: bigint_to_u64(&lamports_per_byte_year)?,
+            exemption_threshold: exemption_threshold.to_le_bytes(),
             burn_percent,
         }))
     }
@@ -41,23 +55,23 @@ impl Rent {
     /// Rental rate in lamports/byte-year.
     #[napi(getter)]
     pub fn lamports_per_byte_year(&self) -> u64 {
-        self.0.lamports_per_byte_year
+        self.0.lamports_per_byte
     }
 
     #[napi(setter)]
     pub fn set_lamports_per_byte_year(&mut self, val: BigInt) -> Result<()> {
-        Ok(self.0.lamports_per_byte_year = bigint_to_u64(&val)?)
+        Ok(self.0.lamports_per_byte = bigint_to_u64(&val)?)
     }
 
     /// Amount of time (in years) a balance must include rent for the account to be rent exempt.
     #[napi(getter)]
     pub fn exemption_threshold(&self) -> f64 {
-        self.0.exemption_threshold
+        f64::from_le_bytes(self.0.exemption_threshold)
     }
 
     #[napi(setter)]
     pub fn set_exemption_threshold(&mut self, val: f64) {
-        self.0.exemption_threshold = val;
+        self.0.exemption_threshold = val.to_le_bytes();
     }
 
     /// The percentage of collected rent that is burned.
@@ -80,8 +94,9 @@ impl Rent {
     /// @returns The amount burned and the amount to distribute to validators.
     #[napi(ts_return_type = "[bigint, bigint]")]
     pub fn calculate_burn(&self, rent_collected: BigInt) -> Result<[u64; 2]> {
-        let res = self.0.calculate_burn(bigint_to_u64(&rent_collected)?);
-        Ok([res.0, res.1])
+        let rent_collected = bigint_to_u64(&rent_collected)?;
+        let burned_portion = (rent_collected * u64::from(self.0.burn_percent)) / 100;
+        Ok([burned_portion, rent_collected - burned_portion])
     }
 
     /// Minimum balance due for rent-exemption of a given account data size.
@@ -119,16 +134,15 @@ impl Rent {
         data_len: BigInt,
         years_elapsed: f64,
     ) -> Result<Option<u64>> {
-        Ok(
-            match self.0.due(
-                bigint_to_u64(&balance)?,
-                bigint_to_usize(&data_len)?,
-                years_elapsed,
-            ) {
-                RentDue::Exempt => None,
-                RentDue::Paying(x) => Some(x),
-            },
-        )
+        let balance = bigint_to_u64(&balance)?;
+        let data_len = bigint_to_usize(&data_len)?;
+        if self.0.is_exempt(balance, data_len) {
+            Ok(None)
+        } else {
+            let actual_data_len = data_len as u64 + ACCOUNT_STORAGE_OVERHEAD;
+            let lamports_per_year = self.0.lamports_per_byte * actual_data_len;
+            Ok(Some((lamports_per_year as f64 * years_elapsed) as u64))
+        }
     }
 
     /// Rent due for account that is known to be not exempt.
@@ -138,9 +152,9 @@ impl Rent {
     /// @returns The amount due.
     #[napi]
     pub fn due_amount(&self, data_len: BigInt, years_elapsed: f64) -> Result<u64> {
-        Ok(self
-            .0
-            .due_amount(bigint_to_usize(&data_len)?, years_elapsed))
+        let actual_data_len = bigint_to_usize(&data_len)? as u64 + ACCOUNT_STORAGE_OVERHEAD;
+        let lamports_per_year = self.0.lamports_per_byte * actual_data_len;
+        Ok((lamports_per_year as f64 * years_elapsed) as u64)
     }
 
     /// Creates a `Rent` that charges no lamports.
@@ -157,9 +171,14 @@ impl Rent {
     /// This is used for testing.
     #[napi(factory)]
     pub fn with_slots_per_epoch(slots_per_epoch: BigInt) -> Result<Self> {
-        Ok(Self(RentOriginal::with_slots_per_epoch(bigint_to_u64(
-            &slots_per_epoch,
-        )?)))
+        let slots_per_epoch = bigint_to_u64(&slots_per_epoch)?;
+        let ratio = slots_per_epoch as f64 / DEFAULT_SLOTS_PER_EPOCH as f64;
+        let legacy_default = Self::default();
+        Ok(Self(RentOriginal {
+            lamports_per_byte: (legacy_default.0.lamports_per_byte as f64 / ratio) as u64,
+            exemption_threshold: (DEFAULT_EXEMPTION_THRESHOLD * ratio).to_le_bytes(),
+            ..RentOriginal::default()
+        }))
     }
 }
 

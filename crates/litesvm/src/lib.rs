@@ -309,13 +309,9 @@ use {
             rent::{check_rent_state_with_account, get_account_rent_state, RentState},
         },
     },
-    agave_feature_set::{
-        increase_cpi_account_info_limit, raise_cpi_nesting_limit_to_8, FeatureSet,
-    },
+    agave_feature_set::{raise_cpi_nesting_limit_to_8, FeatureSet},
     agave_reserved_account_keys::ReservedAccountKeys,
-    agave_syscalls::{
-        create_program_runtime_environment_v1, create_program_runtime_environment_v2,
-    },
+    agave_syscalls::create_program_runtime_environment,
     log::error,
     serde::de::DeserializeOwned,
     solana_account::{Account, AccountSharedData, ReadableAccount, WritableAccount},
@@ -332,6 +328,7 @@ use {
     solana_fee::FeeFeatures,
     solana_fee_structure::FeeStructure,
     solana_hash::Hash,
+    solana_instruction::error::InstructionError,
     solana_keypair::Keypair,
     solana_last_restart_slot::LastRestartSlot,
     solana_loader_v3_interface::state::UpgradeableLoaderState,
@@ -341,9 +338,12 @@ use {
     solana_native_token::LAMPORTS_PER_SOL,
     solana_nonce::{state::DurableNonce, NONCED_TX_MARKER_IX_INDEX},
     solana_program_runtime::{
-        invoke_context::{BuiltinFunctionWithContext, EnvironmentConfig, InvokeContext},
-        loaded_programs::{LoadProgramMetrics, ProgramCacheEntry},
-        solana_sbpf::program::BuiltinFunction,
+        invoke_context::{BuiltinFunctionRegisterer, EnvironmentConfig, InvokeContext},
+        loaded_programs::{
+            ProgramCacheEntry, ProgramRuntimeEnvironment, ProgramRuntimeEnvironments,
+        },
+        program_metrics::LoadProgramMetrics,
+        solana_sbpf::program::{BuiltinFunction, BuiltinProgram},
     },
     solana_rent::Rent,
     solana_sdk_ids::{
@@ -356,7 +356,7 @@ use {
     solana_stake_interface::stake_history::StakeHistory,
     solana_svm_log_collector::LogCollector,
     solana_svm_timings::ExecuteTimings,
-    solana_svm_transaction::svm_message::SVMMessage,
+    solana_svm_transaction::svm_message::SVMStaticMessage,
     solana_system_program::{get_system_account_kind, SystemAccountKind},
     solana_sysvar::{Sysvar, SysvarSerialize},
     solana_sysvar_id::SysvarId,
@@ -364,14 +364,14 @@ use {
         sanitized::{MessageHash, SanitizedTransaction, MAX_TX_ACCOUNT_LOCKS},
         versioned::VersionedTransaction,
     },
-    solana_transaction_context::{ExecutionRecord, IndexOfAccount, TransactionContext},
+    solana_transaction_context::{
+        transaction::{ExecutionRecord, TransactionContext, TransactionReturnData},
+        IndexOfAccount,
+    },
     solana_transaction_error::TransactionError,
     std::{cell::RefCell, path::Path, rc::Rc, sync::Arc},
     types::SimulatedTransactionInfo,
-    utils::{
-        construct_instructions_account,
-        inner_instructions::inner_instructions_list_from_instruction_trace,
-    },
+    utils::{construct_instructions_account, inner_instructions::deconstruct_transaction},
 };
 
 pub mod error;
@@ -425,6 +425,42 @@ impl Default for LiteSVM {
 
         Self::new_inner(_enable_register_tracing)
     }
+}
+
+fn build_program_runtime_environments(
+    feature_set: &FeatureSet,
+    compute_budget: &ComputeBudget,
+    enable_register_tracing: bool,
+) -> ProgramRuntimeEnvironments {
+    let runtime_features = feature_set.runtime_features();
+    let execution = create_program_runtime_environment(
+        &runtime_features,
+        &compute_budget.to_budget(),
+        false,
+        enable_register_tracing,
+    )
+    .expect("program runtime environment should be valid");
+    let deployment = create_program_runtime_environment(
+        &runtime_features,
+        &compute_budget.to_budget(),
+        false,
+        enable_register_tracing,
+    )
+    .expect("deployment runtime environment should be valid");
+
+    ProgramRuntimeEnvironments::new(execution, deployment)
+}
+
+fn clone_program_runtime_environment(
+    environment: &ProgramRuntimeEnvironment,
+) -> BuiltinProgram<InvokeContext<'static, 'static>> {
+    let mut cloned = BuiltinProgram::new_loader((**environment).get_config().clone());
+    for (_key, (name, value)) in (**environment).get_function_registry().iter() {
+        cloned
+            .register_function(unsafe { std::str::from_utf8_unchecked(name) }, value)
+            .expect("program runtime environment registry should clone cleanly");
+    }
+    cloned
 }
 
 impl LiteSVM {
@@ -554,8 +590,8 @@ impl LiteSVM {
                 .feature_set
                 .is_active(&agave_feature_set::deprecate_rent_exemption_threshold::id())
             {
-                rent_account.exemption_threshold = 1.0;
-                rent_account.lamports_per_byte_year = solana_rent::DEFAULT_LAMPORTS_PER_BYTE
+                rent_account.exemption_threshold = 1.0f64.to_le_bytes();
+                rent_account.lamports_per_byte = solana_rent::DEFAULT_LAMPORTS_PER_BYTE;
             }
             self.set_sysvar(&rent_account);
         }
@@ -616,7 +652,7 @@ impl LiteSVM {
                 .is_none_or(|x| self.feature_set.is_active(&x))
             {
                 let loaded_program =
-                    ProgramCacheEntry::new_builtin(0, builtint.name.len(), builtint.entrypoint);
+                    ProgramCacheEntry::new_builtin(0, builtint.name.len(), builtint.register_fn);
                 self.accounts
                     .programs_cache
                     .replenish(builtint.program_id, Arc::new(loaded_program));
@@ -636,24 +672,12 @@ impl LiteSVM {
             .unwrap_or(ComputeBudget::new_with_defaults(
                 self.feature_set
                     .is_active(&raise_cpi_nesting_limit_to_8::ID),
-                self.feature_set
-                    .is_active(&increase_cpi_account_info_limit::ID),
             ));
-        let program_runtime_v1 = create_program_runtime_environment_v1(
-            &self.feature_set.runtime_features(),
-            &compute_budget.to_budget(),
-            false,
-            _enable_register_tracing,
-        )
-        .unwrap();
-
-        let program_runtime_v2 = create_program_runtime_environment_v2(
-            &compute_budget.to_budget(),
+        self.accounts.environments = build_program_runtime_environments(
+            &self.feature_set,
+            &compute_budget,
             _enable_register_tracing,
         );
-
-        self.accounts.environments.program_runtime_v1 = Arc::new(program_runtime_v1);
-        self.accounts.environments.program_runtime_v2 = Arc::new(program_runtime_v2);
     }
 
     /// Changes the default builtins.
@@ -832,7 +856,7 @@ impl LiteSVM {
     }
 
     /// Adds a builtin program to the test environment.
-    pub fn add_builtin(&mut self, program_id: Address, entrypoint: BuiltinFunctionWithContext) {
+    pub fn add_builtin(&mut self, program_id: Address, entrypoint: BuiltinFunctionRegisterer) {
         let builtin = ProgramCacheEntry::new_builtin(
             self.accounts
                 .sysvar_cache
@@ -877,7 +901,7 @@ impl LiteSVM {
             .unwrap_or_default()
             .slot;
 
-        let program_size = if bpf_loader_upgradeable::check_id(loader_id) {
+        let account_size = if bpf_loader_upgradeable::check_id(loader_id) {
             let (programdata_address, _bump) =
                 Address::find_program_address(&[program_id.as_ref()], loader_id);
 
@@ -917,7 +941,7 @@ impl LiteSVM {
             self.accounts
                 .add_account_no_checks(program_id, program_account);
 
-            programdata_len
+            program_account_data.len().saturating_add(programdata_len)
         } else if bpf_loader::check_id(loader_id) || bpf_loader_deprecated::check_id(loader_id) {
             let program_len = program_bytes.len();
             let lamports = self.minimum_balance_for_rent_exemption(program_len);
@@ -934,18 +958,36 @@ impl LiteSVM {
             )));
         };
 
-        let mut loaded_program = solana_bpf_loader_program::load_program_from_bytes(
-            None,
-            &mut LoadProgramMetrics::default(),
-            program_bytes,
-            loader_id,
-            program_size,
-            current_slot,
-            self.accounts.environments.program_runtime_v1.clone(),
-            PREVERIFIED,
-        )
-        .map_err(LiteSVMError::from)?;
-        loaded_program.effective_slot = current_slot;
+        let mut load_program_metrics = LoadProgramMetrics::default();
+        let program_runtime_environment =
+            self.accounts.environments.get_env_for_execution().clone();
+        let loaded_program = if PREVERIFIED {
+            unsafe {
+                ProgramCacheEntry::reload(
+                    loader_id,
+                    program_runtime_environment,
+                    current_slot,
+                    current_slot,
+                    program_bytes,
+                    account_size,
+                    &mut load_program_metrics,
+                )
+            }
+        } else {
+            ProgramCacheEntry::new(
+                loader_id,
+                program_runtime_environment,
+                current_slot,
+                current_slot,
+                program_bytes,
+                account_size,
+                &mut load_program_metrics,
+            )
+        }
+        .map_err(|err| {
+            error!("Failed to load program {program_id}: {err:?}");
+            InstructionError::InvalidAccountData
+        })?;
 
         self.accounts
             .programs_cache
@@ -992,12 +1034,14 @@ impl LiteSVM {
         &self,
         compute_budget: ComputeBudget,
         accounts: Vec<(Address, AccountSharedData)>,
+        number_of_top_level_instructions: usize,
     ) -> TransactionContext<'_> {
         TransactionContext::new(
             accounts,
             self.get_sysvar(),
             compute_budget.max_instruction_stack_depth,
             compute_budget.max_instruction_trace_length,
+            number_of_top_level_instructions,
         )
     }
 
@@ -1043,9 +1087,14 @@ impl LiteSVM {
         &self,
         tx: VersionedTransaction,
     ) -> Result<SanitizedTransaction, TransactionError> {
-        let tx = self.sanitize_transaction_no_verify_inner(tx)?;
-
-        tx.verify()?;
+        let message_hash = tx.verify_and_hash_message()?;
+        let tx = SanitizedTransaction::try_create(
+            tx,
+            MessageHash::Precomputed(message_hash),
+            Some(false),
+            &self.accounts,
+            &self.reserved_account_keys.active,
+        )?;
         SanitizedTransaction::validate_account_locks(
             tx.message(),
             get_transaction_account_lock_limit(self),
@@ -1075,8 +1124,6 @@ impl LiteSVM {
             ..ComputeBudget::new_with_defaults(
                 self.feature_set
                     .is_active(&raise_cpi_nesting_limit_to_8::ID),
-                self.feature_set
-                    .is_active(&increase_cpi_account_info_limit::ID),
             )
         });
         let rent = self.accounts.sysvar_cache.get_rent().unwrap();
@@ -1192,8 +1239,12 @@ impl LiteSVM {
             .collect::<Result<Vec<u16>, TransactionError>>();
 
         match maybe_program_indices {
-            Ok(program_indices) => {
-                let mut context = self.create_transaction_context(compute_budget, accounts);
+            Ok(_program_indices) => {
+                let mut context = self.create_transaction_context(
+                    compute_budget,
+                    accounts,
+                    message.num_instructions(),
+                );
                 let feature_set = self.feature_set.runtime_features();
                 let mut invoke_context = InvokeContext::new(
                     &mut context,
@@ -1201,9 +1252,9 @@ impl LiteSVM {
                     EnvironmentConfig::new(
                         *blockhash,
                         self.fee_structure.lamports_per_signature,
+                        false,
                         self,
                         &feature_set,
-                        &self.accounts.environments,
                         &self.accounts.environments,
                         &self.accounts.sysvar_cache,
                     ),
@@ -1216,13 +1267,12 @@ impl LiteSVM {
                 self.invocation_inspect_callback.before_invocation(
                     self,
                     tx,
-                    &program_indices,
+                    &_program_indices,
                     &invoke_context,
                 );
 
                 let mut tx_result = process_message(
                     message,
-                    &program_indices,
                     &mut invoke_context,
                     &mut ExecuteTimings::default(),
                     &mut accumulated_consume_units,
@@ -1654,27 +1704,34 @@ impl LiteSVM {
         name: &str,
         syscall: BuiltinFunction<InvokeContext<'static, 'static>>,
     ) -> Self {
-        let (Some(program_runtime_v1), Some(program_runtime_v2)) = (
-            Arc::get_mut(&mut self.accounts.environments.program_runtime_v1),
-            Arc::get_mut(&mut self.accounts.environments.program_runtime_v2),
-        ) else {
-            panic!("with_custom_syscall: can't mutate program runtimes");
-        };
+        let mut execution =
+            clone_program_runtime_environment(self.accounts.environments.get_env_for_execution());
+        let mut deployment =
+            clone_program_runtime_environment(self.accounts.environments.get_env_for_deployment());
 
         // Once unregister_function is available, users could replace existing built-in
         // syscalls.
 
         // TODO: uncomment once https://github.com/anza-xyz/sbpf/pull/153 is available.
-        // let _ = program_runtime_v1.unregister_function(name);
-        program_runtime_v1
-            .register_function(name, syscall)
-            .unwrap_or_else(|e| panic!("failed to register syscall '{name}' in runtime_v1: {e}"));
+        // let _ = execution.unregister_function(name);
+        execution
+            .register_function(name, (syscall, |_| {}))
+            .unwrap_or_else(|e| {
+                panic!("failed to register syscall '{name}' in execution runtime: {e}")
+            });
 
         // TODO: uncomment once https://github.com/anza-xyz/sbpf/pull/153 is available.
-        // let _ = program_runtime_v2.unregister_function(name);
-        program_runtime_v2
-            .register_function(name, syscall)
-            .unwrap_or_else(|e| panic!("failed to register syscall '{name}' in runtime_v2: {e}"));
+        // let _ = deployment.unregister_function(name);
+        deployment
+            .register_function(name, (syscall, |_| {}))
+            .unwrap_or_else(|e| {
+                panic!("failed to register syscall '{name}' in deployment runtime: {e}")
+            });
+
+        self.accounts.environments = ProgramRuntimeEnvironments::new(
+            ProgramRuntimeEnvironment::from(execution),
+            ProgramRuntimeEnvironment::from(deployment),
+        );
 
         self
     }
@@ -1718,18 +1775,20 @@ fn execute_tx_helper(
     ctx: TransactionContext,
 ) -> (
     Signature,
-    solana_transaction_context::TransactionReturnData,
+    TransactionReturnData,
     InnerInstructionsList,
     Vec<(Address, AccountSharedData)>,
 ) {
     let signature = sanitized_tx.signature().to_owned();
-    let inner_instructions = inner_instructions_list_from_instruction_trace(&ctx);
-    let ExecutionRecord {
-        accounts,
-        return_data,
-        touched_account_count: _,
-        accounts_resize_delta: _,
-    } = ctx.into();
+    let (
+        ExecutionRecord {
+            accounts,
+            return_data,
+            touched_account_count: _,
+            accounts_resize_delta: _,
+        },
+        inner_instructions,
+    ) = deconstruct_transaction(ctx);
     let msg = sanitized_tx.message();
     let post_accounts = accounts
         .into_iter()
@@ -1743,14 +1802,11 @@ fn get_compute_budget_limits(
     sanitized_tx: &SanitizedTransaction,
     feature_set: &FeatureSet,
 ) -> Result<ComputeBudgetLimits, ExecutionResult> {
-    process_compute_budget_instructions(
-        SVMMessage::program_instructions_iter(sanitized_tx),
-        feature_set,
-    )
-    .map_err(|e| ExecutionResult {
-        tx_result: Err(e),
-        ..Default::default()
-    })
+    process_compute_budget_instructions(sanitized_tx.program_instructions_iter(), feature_set)
+        .map_err(|e| ExecutionResult {
+            tx_result: Err(e),
+            ..Default::default()
+        })
 }
 
 /// Get the max number of accounts that a transaction may lock in this block

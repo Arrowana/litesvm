@@ -510,6 +510,7 @@ fn test_stake_initialize() {
         stake_state,
         StakeStateV2::Initialized(Meta {
             authorized,
+            #[allow(deprecated)]
             rent_exempt_reserve,
             lockup,
         }),

@@ -2,11 +2,11 @@ use {
     litesvm::LiteSVM,
     solana_address::Address,
     solana_keypair::Keypair,
-    solana_message::Message,
+    solana_message::{v1, Message, VersionedMessage},
     solana_native_token::LAMPORTS_PER_SOL,
     solana_signer::Signer,
     solana_system_interface::instruction::{allocate, create_account, transfer},
-    solana_transaction::Transaction,
+    solana_transaction::{versioned::VersionedTransaction, Transaction},
 };
 
 #[test_log::test]
@@ -33,7 +33,40 @@ fn system_transfer() {
     let from_account = svm.get_account(&from);
     let to_account = svm.get_account(&to);
 
-    assert!(tx_res.is_ok());
+    assert!(tx_res.is_ok(), "transfer failed: {:?}", tx_res.err());
+    assert_eq!(
+        from_account.unwrap().lamports,
+        original_balance - expected_fee - transfer_amount
+    );
+    assert_eq!(
+        to_account.unwrap().lamports,
+        original_balance + transfer_amount
+    );
+}
+
+#[test_log::test]
+fn system_transfer_v1() {
+    let from_keypair = Keypair::new();
+    let from = from_keypair.pubkey();
+    let to = Address::new_unique();
+
+    let mut svm = LiteSVM::new();
+    let expected_fee = 5000;
+    let original_balance = LAMPORTS_PER_SOL;
+    svm.airdrop(&from, original_balance).unwrap();
+    svm.airdrop(&to, original_balance).unwrap();
+
+    let transfer_amount = 64;
+    let instruction = transfer(&from, &to, transfer_amount);
+    let message = v1::Message::try_compile(&from, &[instruction], svm.latest_blockhash()).unwrap();
+    let tx =
+        VersionedTransaction::try_new(VersionedMessage::V1(message), &[&from_keypair]).unwrap();
+    let tx_res = svm.send_transaction(tx);
+
+    let from_account = svm.get_account(&from);
+    let to_account = svm.get_account(&to);
+
+    assert!(tx_res.is_ok(), "v1 transfer failed: {:?}", tx_res.err());
     assert_eq!(
         from_account.unwrap().lamports,
         original_balance - expected_fee - transfer_amount
